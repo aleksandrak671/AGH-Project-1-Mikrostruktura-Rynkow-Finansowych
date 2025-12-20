@@ -1,0 +1,1 @@
+# AGH-Project-Mikrostruktura-Rynk-w-Finansowych-project-1-
