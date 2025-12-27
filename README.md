@@ -21,6 +21,3 @@ This project analyzes high-frequency financial data (tick-by-tick) from the Wars
 ## Technologies
 - Language: R
 - Libraries: tidyverse, highfrequency, rugarch, xts, lubridate, moments, gridExtra
-
-## Authors
-- Aleksandra Konopelska
