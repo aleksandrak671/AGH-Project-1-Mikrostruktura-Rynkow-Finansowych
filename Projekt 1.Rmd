@@ -1,0 +1,842 @@
+---
+title: "Analiza Mikrostruktury Rynków Finansowych i Modelowanie Zmienności Śróddziennej"
+author: "Klaudia Rajca, Aleksandra Konopelska"
+date: "2025-12-17"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=6)
+
+# niezbędne pakiety
+library(tidyverse)
+library(lubridate)
+library(xts)
+library(highfrequency)
+library(rugarch)
+library(moments)
+library(gridExtra)
+library(knitr)
+library(rugarch) # do metody Engle i Sokalskiej
+library(gridExtra)  # do wykresów w metodzie Engle i Sokalskiej
+```
+
+
+# Metodologia i Plan Analizy
+
+1.  **Wstępne przetwarzanie naszych danych:** Ograniczenie zbioru danych do godzin sesji ciągłej (09:00–17:05) oraz eliminacja transakcji pakietowych i błędnych, w celu zapewnienia wiarygodności naszych wyników.
+
+2.  **Analiza statystyk opisowych:** Porównanie płynności i charakterystyki obu spółek poprzez analizę średnich cen, wolumenów (kluczowy wskaźnik miary aktywności rynku, oznaczający łączną liczbę akcji, kontraktów lub jednostek finansowych, które zmieniły właściciela w określonym czasie (np. w ciągu dnia), odzwierciedlając zainteresowanie inwestorów danym instrumentem) oraz duracji (odstępów czasu między transakcjami).
+
+3.  **Analiza własności stóp zwrotu (dane 1-sekundowe):** Agregacja danych transakcyjnych do częstotliwości 1-sekundowej oraz weryfikacja występowania stylizowanych faktów, takich jak grube ogony rozkładu (kurtoza) czy ujemna autokorelacja.
+
+4.  **Badanie sezonowości śróddziennej (dane 5-minutowe):** Analiza rozkładu zmienności i wolumenu w przekroju sesji giełdowej w celu potwierdzenia hipotezy o występowaniu efektu "U-kształtnego".
+
+5.  **Modelowanie i desezonowanie:** Zastosowanie modelu Elastycznej Formy Fouriera (FFF) oraz modelu Engle-Sokalskiej w celu usunięcia deterministycznej składowej sezonowej ze stóp zwrotu.
+
+
+---
+
+
+# Analiza danych transakcyjnych
+
+**Cel naszego projektu** podzielony jest na dwa główne etapy:
+
+1. Własności danych śróddziennych:
+
+Jest to analiza, jak zachowuje się cena akcji w ciągu jednego dnia (od rana do wieczora), zamiast patrzeć na to, jak zmieniła się w ciągu roku.
+
+* **Dane tick-by-tick:**
+    * Dane rejestrowane "transakcja po transakcji" (każda pojedyncza sprzedaż jest zapisana).
+    * *Co będziemy badały:* Częstotliwość handlu, gwałtowne skoki cen (**kurtoza**) oraz to, czy po spadku cena natychmiast odbija (**autokorelacja**).
+
+* **Dane 5-minutowe:**
+    * Dane zagregowane ("zlepione") w słupki co 5 minut.
+    * *Co będziemy badały:* Rozkład aktywności w ciągu dnia, np. czy o godzinie 9:00 rano ruch jest większy niż w porze lunchu (12:00)?
+
+2. Modelowanie zmienności danych śróddziennych: 
+
+To wykorzystanie metod matematycznych (modeli FFF i Engle-Sokalskiej) w celu neutralizacji efektu sezonowości.
+
+* **Sezonowość:** Powtarzalny wzorzec zachowania rynku. Na giełdzie przyjmuje on kształt litery **U**: rano jest nerwowo (dużo się dzieje), w południe panuje spokój, a wieczorem znów następuje ożywienie.
+* **Zmienność:** Miara tego, jak mocno i gwałtownie zmienia się cena ("szaleje").
+
+**Nasz głowny cel:** Wziąć wykres zmienności, który naturalnie jest "krzywy" (ma górki rano i wieczorem), i za pomocą modelowania sprawić, żeby stał się **"płaski"**. Jeśli wykres po naszych obliczeniach jest płaski zadanie zostało przez nas wykonane, model zadziałał poprawnie.
+
+
+## Czyszczenie danych (usuwanie transakcji poza sesją)
+
+Wybrane spółki i okres badawczy:
+
+**Okres analizy:** 02.01.2018 – 29.06.2018.
+
+* **Spółka D** – Charakteryzuje się wysokim kursem (~460 PLN) oraz niższą płynnością (rzadsze transakcje).
+* **Spółka H** – Charakteryzuje się niskim kursem (~7.50 PLN) oraz bardzo wysoką płynnością.
+
+```{r}
+# wczytanie plików ze spółkami
+plik_spolka_D <- "spolkaD.csv"
+plik_spolka_H <- "spolkaH.csv"
+
+# nasz zakres dat 
+start_date <- as.Date("2018-01-02")
+end_date   <- as.Date("2018-06-29")
+
+# funkcja która będzie wczytywać dane 
+
+# punkt I.1 instrukcji: usuwamy transakcje spoza sesji (przed 9:00 i po 17:05)
+wczytaj_dane <- function(sciezka, nazwa_spolki) {
+  
+  # 1. wczytanie pliku (polski format CSV: średnik i przecinek)
+  df <- read.csv(sciezka, sep = ";", dec = ",") %>%
+    rename(
+      Data = daty,
+      Godzina = godz,
+      Kurs = cena,
+      Wolumen = vol
+    ) %>%
+    mutate(
+     # naprawaimy godziny: zamieniamy liczbę 90000 na tekst "090000" (dodaje brakujące zero na początku)
+      godz_str = sprintf("%06d", as.numeric(Godzina)),
+        # tworzymy pełny czas: skleja datę z godziną (czas, nie zwykły napis)
+      datetime = ymd_hms(paste(Data, godz_str)),
+      # wyciągamy samą date (bez godziny) do późniejszego grupowania
+  date = as.Date(datetime),
+      # konwersja na liczby (dla pewności)
+      Cena = as.numeric(Kurs),
+      Wolumen = as.numeric(Wolumen)
+    ) %>%
+    
+    # 2. filtrowanie okresu badawczego
+    filter(date >= start_date & date <= end_date) %>%
+    
+    # 3. filtrowanie godzin sesji
+    # zostawiamy zakres: 09:00:00 - 17:05:00
+    filter(
+      (hour(datetime) > 9 | (hour(datetime) == 9 & minute(datetime) >= 0)) &
+      (hour(datetime) < 17 | (hour(datetime) == 17 & minute(datetime) <= 5))
+    ) %>%
+    select(datetime, date, Cena, Wolumen) %>% # wybieramy tylko potrzebne kolumny
+    arrange(datetime) %>% # sortujemy od najstarszej do najnowszej (patrząc na czas (datetime))
+    mutate(Ticker = nazwa_spolki) # w kolumnie o nazwie 'Ticker' wpisujemy każdemu wierszowi, jak się nazywa ta spółka
+  
+  return(df)
+}
+
+# używamy naszej funkcji: czyścimy nasze pliki ze społkmai i zapisujemy gotową tabelę w pamięci jako df_D i df_H.df_D
+df_D <- wczytaj_dane(plik_spolka_D, "SPOLKA_D")
+df_H <- wczytaj_dane(plik_spolka_H, "SPOLKA_H")
+
+# krótkie sprawdzenie poprawności wczytania
+podsumowanie_danych <- data.frame(
+  Spolka = c("Spółka D", "Spółka H"),
+  Liczba_Transakcji = c(nrow(df_D), nrow(df_H)),
+  Data_Poczatek = c(min(df_D$date), min(df_H$date)),
+  Data_Koniec = c(max(df_D$date), max(df_H$date))
+)
+
+kable(podsumowanie_danych, caption = "Podsumowanie naszych wczytanych danych po oczyszczeniu")
+```
+
+
+## Statystyki Opisowe
+
+Porównujemy teraz nasze spółki. Musimy sprawdzić: ceny, wolumeny, liczbę transakcji oraz **durację** (czyli jak dużo czasu mija między jedną a drugą transakcją).
+
+Czas między transakcjami (durację) liczymy tylko w godzinach pracy giełdy (do 16:50). Ignorujemy noc, żeby sztucznie nie zawyżać wyników przerwą między zamknięciem a otwarciem sesji.
+
+```{r}
+# funkcja do policzenia naszych wszystkich wymaganych statystyk
+oblicz_statystyki <- function(df) {
+  
+  # A. liczymy durację
+  # filtrujemy dane: bierzemy tylko te do 16:50
+  df_ciagle <- df %>%
+    filter(hour(datetime) < 16 | (hour(datetime) == 16 & minute(datetime) <= 50)) %>%
+    mutate(duracja = as.numeric(diff(c(datetime[1], datetime)))) # różnica czasu w sekundach
+  
+  # B. statystyki dzienne (sumujemy wolumeny i obroty dla każdego dnia osobno)
+  stat_dzienne <- df %>%
+    group_by(date) %>%
+    summarise(
+      dzienny_wolumen = sum(Wolumen),
+      dzienna_wartosc_obrotu = sum(Cena * Wolumen), 
+      liczba_transakcji_w_sesji = n()
+    )
+  
+  # C. zbieramy wszystko w jedną tabelkę podsumowującą
+  wyniki <- data.frame(
+    Srednia_Cena = mean(df$Cena),
+    Mediana_Wolumenu = median(df$Wolumen),
+    # średnia duracja (bierzemy tylko dodatnie odstępy > 0)
+    Srednia_Duracja_Sek = mean(df_ciagle$duracja[df_ciagle$duracja > 0]),
+    Srednia_L_Transakcji_Sesja = mean(stat_dzienne$liczba_transakcji_w_sesji),
+    Sredni_Obrot_Dzienny_PLN = mean(stat_dzienne$dzienna_wartosc_obrotu)
+  )
+  
+  return(wyniki)
+}
+
+# używamy funkcji dla obu naszych wybranych spółek
+stat_D <- oblicz_statystyki(df_D) %>% mutate(Spolka = "SPOLKA_D")
+stat_H <- oblicz_statystyki(df_H) %>% mutate(Spolka = "SPOLKA_H")
+
+# łączymy wyniki i wyświetlamy tabele
+tabela_stat <- bind_rows(stat_D, stat_H) %>% select(Spolka, everything())
+kable(tabela_stat, digits = 2, caption = "Statystyki opisowe")
+```
+
+Wnioski:
+
+1. **Cena a Wolumen:**
+
+ - Spółka D jest droga (ok. 462 zł), więc inwestorzy kupują ją rzadko i w małych ilościach (mediana tylko 13 sztuk).
+
+ - Spółka H jest tania (ok. 7.50 zł), więc handluje się nią hurtowo (mediana aż 1000 sztuk).
+
+2. **Czas oczekiwania (Duracja):**
+
+ - Na transakcję Spółką D trzeba czekać średnio aż 365 sekund (6 minut). To oznacza niską płynność.
+
+ - Na transakcję Spółką H czeka się krócej, bo 181 sekund (3 minuty). To oznacza wyższą płynność.
+
+3. **Liczba transakcji:**
+
+ - Spółka H jest znacznie bardziej aktywna –> ma prawie dwa razy więcej transakcji w ciągu dnia (1603) niż Spółka D (833).
+
+**Podsumowanie:** Potwierdziłiśmy założenia. Spółka D to "drogi i powolny" walor, a Spółka H to walor "tani i płynny".
+
+
+
+## Agregacja do 1 sekundy
+
+Będziemy musiałY "zbić" (zagregować) nasze dane do częstotliwości 1-sekundowej. Nie bierzemy ostatniej ceny z danej sekundy (Robimy to, aby wynik był wiarygodny: w ciągu jednej sekundy może wystąpić wiele transakcji, a ostatnia z nich może być przypadkowa (np. o bardzo małym wolumenie i nietypowej cenie). Średnia ważona sprawia, że cena dla danej sekundy odzwierciedla to, po ile faktycznie wymieniono większość akcji, eliminując wpływ pojedynczych, przypadkowych transakcji ("szum informacyjny")). Liczymy średnią ważoną wolumenem (VWAP). Wzór: Suma(Cena * Wolumen) / Suma(Wolumenu).
+
+```{r}
+# funkcja agregująca: zbijamy transakcje w 1-sekundowe punkty
+agreguj_do_sekundy <- function(df) {
+  df %>%
+    mutate(sekunda = floor_date(datetime, "1 second")) %>% # zaokrąglamy czas w dół do pełnej sekundy
+    group_by(sekunda) %>%
+    summarise(
+      # średnia ważona wolumenem
+      Cena = sum(Cena * Wolumen) / sum(Wolumen),
+      Wolumen = sum(Wolumen)
+    ) %>%
+    # od razu liczymy stopy zwrotu (potrzebne do punktu 4)
+    # wzór: ln(Cena_teraz) - ln(Cena_wczesniej)
+    mutate(zwrot_log = c(NA, diff(log(Cena)))) %>%
+    filter(!is.na(zwrot_log) & !is.infinite(zwrot_log)) # wyrzucamy puste wiersze (np. pierwszy)
+}
+
+# wykonujemy agregację dla obu naszych wybranych spółek
+df_D_1s <- agreguj_do_sekundy(df_D)
+df_H_1s <- agreguj_do_sekundy(df_H)
+
+# sprawdzamy, wyświetlamy pierwsze 5 wierszy dla Spółki D
+kable(head(df_D_1s, 5), caption = "Przykładowe dane po agregacji do 1 sekundy")
+```
+
+Wnioski z naszej tabeli, próbki danych (Agregacja):
+
+ - Nasz kod działa dobrze: kiedy cena w tabeli spada (z 489 na 486 zł), stopa zwrotu wychodzi ujemna.
+
+ - Dowód na małą płynność: W kolumnie z czasem widać przerwy (np. przeskok aż o 45 sekund). Oznacza to, że przez prawie minutę nikt nie handlował (typowe dla mało płynnych spółek, wiele sekund jest "pustych"). 
+
+ - Potwierdzenie danych: Wysoka cena (~489 zł) i mała liczba akcji (kilka sztuk) potwierdzają, że patrzymy na właściwą, "drogą" wybraną przez nas Spółkę D.
+    
+    
+## Analiza Stóp Zwrotu
+
+W punkcie 4 musimy sprawdzić, czy nasze stopy zwrotu są "normalne". Będziemy badały trzy rzeczy:
+
+ - **Skośność:** Czy nasz wykres jest przechylony w którąś stronę?
+
+ - **Kurtoza (Grube ogony):** Sprawdzamy, czy rozkład stóp zwrotu różni się od normalnego (dla którego kurtoza = 3). Wysoki wynik oznacza występowanie tzw. "grubych ogonów", czyli na rynku częściej niż w teorii zdarzają się nagłe, ekstremalne skoki cen. 
+ 
+(sprawdzamy czy zdarzają się "szoki cenowe". Wynik powyżej 3 oznacza, że rynek nie jest stabilny -> często występują nagłe, ekstremalne zmiany ceny (tzw. "grube ogony")).
+
+ - **Autokorelacja:** Sprawdzamy występowanie ujemnej autokorelacji (czy cena "odbija"). Jest to skutek tzw. odbicia bid-ask (bid-ask bounce). Zjawisko to występuje, gdy transakcje zawierane są na zmianę po cenie kupna (bid) i sprzedaży (ask), co powoduje sztuczne wahania ceny (góra-dół).
+ 
+(Weryfikujemy, czy cena podąża w określonym kierunku (trend), czy chaotycznie "skacze". Ujemny wynik oznacza, że cena nieustannie oscyluje góra-dół pomiędzy ofertami kupna i sprzedaży. Zamiast płynnego ruchu, obserwujemy "zygzak" wewnątrz spreadu –> cena technicznie się zmienia, mimo że rzeczywista wartość spółki w tym ułamku sekundy pozostaje stała).
+    
+```{r}
+# funkcja badająca własności statystyczne
+analiza_wlasnosci <- function(df_sek, nazwa) {
+  r <- df_sek$zwrot_log # bierzemy nasze stopy zwrotu
+  
+  data.frame(
+    Spolka = nazwa,
+    Skosnosc = skewness(r),       # asymetria
+    Kurtoza = kurtosis(r),        # czy są "grube ogony"?
+    Autokorelacja_Lag1 = acf(r, plot=FALSE)$acf[2] # czy cena skacze góra-dół? (ujemna korelacja)
+  )
+}
+
+# zbieramy nasze wyniki do tabeli
+wyniki_zwroty <- bind_rows(
+  analiza_wlasnosci(df_D_1s, "SPOLKA_D"),
+  analiza_wlasnosci(df_H_1s, "SPOLKA_H")
+)
+
+kable(wyniki_zwroty, digits = 4, caption = "Własności stóp zwrotu")
+```
+
+Wnioski z analizy stóp zwrotu:
+
+1. **Ekstremalna Kurtoza ("Grube ogony"):**
+
+- Dla obu spółek kurtoza jest bardzo duża (77.5 dla Spółki D i 11.6 dla Spółki H), znacznie powyżej wartości 3 (charakterystycznej dla rozkładu normalnego). Czyli, rozkład stóp zwrotu nie jest normalny. Na rynku często zdarzają się nagłe, gwałtowne skoki cen.
+
+2. **Ujemna Autokorelacja (Efekt "odbicia"):**
+
+ - Obie spółki mają ujemną autokorelację (-0.19 i -0.32). Potwierdza to występowanie zjawiska odbicia bid-ask (bid-ask bounce). Cena w krótkim terminie "skacze" góra-dół pomiędzy ofertami kupna i sprzedaży, zamiast podążać w jednym, płynnym trendzie.
+
+**Podsumowanie:** Nasze otrzymane wyniki (wysoka kurtoza i ujemna autokorelacja) potwierdzają specyficzne własności danych śróddziennych, odróżniające je od danych dziennych.
+
+
+# Analiza danych 5-minutowych
+
+W tej części projektu bedziemy badały zmienność i płynność wewnątrz dnia. Agregujemy dane do interwałów 5-minutowych, aby sprawdzić, czy na rynku występuje tzw. sezonowość śróddzienną (czy pora dnia ma wpływ na zachowanie inwestorów, gdyż pora dnia ma bardzo duży wpływ. O np: 9:00 ludzie handlują inaczej niż o 13:00).
+
+Zgodnie z instrukcją:
+
+ - Transakcje z dogrywki (17:00–17:05) traktujemy jako jeden przedział.
+
+ - Usuwamy stopy zwrotu overnight (pierwszą zmianę ceny w dniu, wynikającą z różnicy między zamknięciem wczorajszym a otwarciem dzisiejszym), aby nie zafałszować wyników gigantycznym skokiem na otwarciu.
+ 
+```{r}
+# Krok 1: agregacja danych do 5 minut
+
+agreguj_5min <- function(df) { 
+  df %>%
+    # zaokrąglamy czas w góre do pełnych 5 minut (np. 09:01 -> 09:05).
+    # etykieta mówi, kiedy skończyliśmy zbierać dane do tego konkretnego słupka
+    mutate(interval_5min = ceiling_date(datetime, "5 minutes")) %>%
+        # wszystko po godzinie 17:00 trafia do jednego worka "17:05"
+    mutate(interval_5min = if_else(hour(interval_5min) == 17 & minute(interval_5min) > 0,
+                                   ymd_hms(paste(date(interval_5min), "17:05:00")),
+                                   interval_5min)) %>%
+    
+    group_by(Ticker, date, interval_5min) %>%
+    summarise(
+      Close = last(Cena),           # cena zamknięcia interwału
+      Wolumen = sum(Wolumen),       # suma wolumenu w 5 minut
+      Liczba_Trans = n(),           # liczba transakcji w 5 minut
+      .groups = "drop"
+    ) %>%
+    
+    # sortujemy chronologiczne
+    arrange(Ticker, date, interval_5min) %>%
+    
+    group_by(Ticker, date) %>%
+    mutate(
+      # stosujemy zwroty logarytmiczne, ponieważ są one addytywne w czasie (można je sumować), co ułatwia analizę statystyczną
+      zwrot_log = c(NA, diff(log(Close))),
+      
+      # log wolumen, aby zmniejszyć wpływ skrajnie dużych transakcji (outliers) i poprawić czytelność wykresu (rozkład wolumenu jest silnie skośny).
+      # dodajemy +1, aby uniknąć błędu log(0) w momentach braku handlu
+      log_vol = log(Wolumen + 1)
+    ) %>%
+    
+    # przed przystąpieniem do dalszej analizy, wyeliminujemy z uzyskanego szeregu czasowego stopy zwrotu overnight
+    # dzięki grupowaniu po dacie, pierwszy zwrot w każdym dniu jest NA i go wyrzucamy
+    filter(!is.na(zwrot_log)) %>%
+    
+    # wyciągamy samą godzinę nam potrzebną (slot czasowy) do wykresów (np. "09:05", "09:10")
+    mutate(slot_czasowy = format(interval_5min, "%H:%M"))
+}
+
+# przetwarzamy nasze dane dla obu wybranych spółek
+dane_5min_D <- agreguj_5min(df_D)
+dane_5min_H <- agreguj_5min(df_H)
+
+# tabela (aby łatwiej robić wykresy)
+dane_5min_calosc <- bind_rows(dane_5min_D, dane_5min_H)
+```
+
+Teraz będziemy obliczały statystyki przekrojowe. Dla każdego przedziału czasowego (np. dla godziny 10:00) liczymy średnią ze wszystkich dni w półroczu. Pozwoli nam to zobaczyć typowy wzorzec dnia giełdowego, eliminując szum z pojedynczych dni.
+
+Będą interesowały nas trzy miary:
+
+ - **Średnia liczba transakcji (Aktywność):** Mierzy tłok na rynku (ile razy zawarto transakcję), bez względu na jej wielkość.
+
+ - **Średni logarytm wolumenu (Płynność):** Mierzy ilość wymienionego towaru. Logarytm sprawia, że wykres jest bardziej czytelny mimo ogromnych różnic w wolumenie.
+
+ - **Średnia wartość bezwzględna zwrotu (Zmienność):** Kluczowa miara. Zamieniamy spadki na plusy (moduł), żeby zmierzyć siłę ruchu ceny, a nie jej kierunek. Ten wskaźnik będzie ujawniał nam "rytm dnia" (sezonowość w kształcie litery U).
+
+```{r}
+# Krok 2: obliczenie średnich przekrojowych
+
+statystyki_przekrojowe <- dane_5min_calosc %>%
+  group_by(Ticker, slot_czasowy) %>%
+  summarise(
+    Srednia_Zwrot = mean(zwrot_log, na.rm = TRUE),
+    
+    # miara zmienności (nerwowość rynku), używamy abs() (wartość bezwzględna), żeby zamienić spadki na plusy
+    # dzięki temu mierzymy siłę ruchu ceny, a nie kierunek
+    # (bez abs() wzrosty i spadki by się zniosły i średnia wyszłaby bliska zeru)
+    Srednia_Abs_Zwrot = mean(abs(zwrot_log), na.rm = TRUE),
+    
+    Srednia_L_Trans = mean(Liczba_Trans, na.rm = TRUE),
+    Sredni_Log_Vol = mean(log_vol, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # tworzymy sztuczną datę (żeby wykres wiedział, że oś X to czas)
+  mutate(czas_wykres = as.POSIXct(paste("2024-01-01", slot_czasowy), format="%Y-%m-%d %H:%M"))
+```
+
+Wykresy obrazujące przebieg sesji. Szukamy charakterystycznego kształtu litery "U", który świadczy o zwiększonej aktywności i nerwowości rynku na otwarciu i zamknięciu sesji, oraz uspokojeniu w środku dnia.
+
+```{r}
+# Krok 3: wykresy
+
+# fun pomocnicza do rysowania
+rysuj_sezonowosc <- function(dane, kolumna_y, tytul, y_label) {
+  ggplot(dane, aes(x = czas_wykres, y = .data[[kolumna_y]], color = Ticker)) +
+    geom_line(size = 1) +
+    facet_wrap(~Ticker, scales = "free_y", ncol = 1) + # rozdzielamy spółki na dwa panele jeden po drugim na wykresie, każdy z własną dopasowaną skalą
+    scale_x_datetime(date_labels = "%H:%M", date_breaks = "1 hour") +
+    labs(title = tytul, x = "Godzina", y = y_label) +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+```
+
+```{r}
+# średnie stopy zwrotu
+p0 <- rysuj_sezonowosc(statystyki_przekrojowe, "Srednia_Zwrot", 
+                       "Przekrojowe średnie stóp zwrotu", "Średni zwrot log")
+p0
+```
+
+```{r}
+# Średnia liczba transakcji (aktywność)
+p1 <- rysuj_sezonowosc(statystyki_przekrojowe, "Srednia_L_Trans", 
+                       "Średnia liczba transakcji (Aktywność)", "Liczba transakcji")
+p1
+```
+
+```{r}
+# średni logarytm wolumenu (płynność)
+p2 <- rysuj_sezonowosc(statystyki_przekrojowe, "Sredni_Log_Vol", 
+                       "Średni logarytm wolumenu", "Log(Wolumen)")
+p2
+```
+
+
+```{r}
+# zmienność (średnie absolutne zwroty) -> ważne dla sezonowości
+p3 <- rysuj_sezonowosc(statystyki_przekrojowe, "Srednia_Abs_Zwrot", 
+                       "Sezonowość zmienności (Średnie |r|)", "Średni moduł zwrotu")
+p3
+```
+
+## Interpretacja wykresów (Porównanie naszych wybranych spółek SPOLKA_D i SPOLKA_H):
+
+**1. Przekrojowe średnie stopy zwrotu (Kierunek zmian cen):** Wykres średnich stóp zwrotu (pierwszy wykres) wyraźnie różni się od pozostałych. Oscyluje on wokół zera (szum) i nie wykazuje żadnego wyraźnego trendu ani kształtu "U". Jest to zachowanie oczekiwane i zgodne z hipotezą rynku efektywnego. Oznacza to, że pora dnia nie determinuje kierunku zmian cen (zysk czy strata są losowe), a jedynie ich intensywność, co analizujemy w kolejnych punktach.
+
+**2. Aktywność inwestorów (Liczba transakcji i Wolumen):**
+
+* **Wzorzec "U":** Płynna SPOLKA_H (dolne wykresy) wykazuje klasyczny dla rynków giełdowych kształt "U". Aktywność jest najwyższa na otwarciu (reakcja na informacje overnight), wyraźnie spada w "porze lunchu" (ok. 12:00–14:00) i ponownie rośnie pod koniec sesji.
+* **Mniejsza płynność:** SPOLKA_D (górne wykresy) charakteryzuje się bardziej płaskim i nieregularnym przebiegiem w środku dnia, co świadczy o sporadycznym zawieraniu transakcji w tym okresie.
+* **Efekt zamknięcia (Fixing):** Na obu spółkach (a szczególnie na SPOLKA_D) widać gigantyczny "pik" wolumenu o godzinie 17:00. Potwierdza to, że znaczna część dziennego obrotu realizowana jest na aukcji zamknięcia.
+
+**3. Sezonowość Zmienności (Średnie $|r|$):**
+
+* **Dynamika ryzyka:** Wykresy średnich modułów zwrotu potwierdzają obserwacje z wolumenu. SPOLKA_H ma gładki przebieg w kształcie litery "U" –> duża zmienność rano (poszukiwanie ceny równowagi) i wieczorem, a stabilizacja w południe.
+* **Nieregularność:** SPOLKA_D wykazuje wysoką zmienność na otwarciu, jednak w ciągu dnia wykres jest mocno "poszarpany" (zaszumiony), co wynika z mniejszej płynności tej spółki.
+
+**Wniosek:** Wykresy jednoznacznie potwierdzają występowanie śróddziennej sezonowości zmienności i aktywności. Parametry te nie są stałe, lecz silnie skorelowane z porą dnia (efekt otwarcia, lunchu i zamknięcia). Natomiast same stopy zwrotu (kierunek) nie wykazują sezonowości.
+
+Obserwacje te uzasadniają konieczność przeprowadzenia procedury odsezonowania danych (w zakresie zmienności) przed estymacją modeli ekonometrycznych, aby usunąć ten deterministyczny wzorzec.
+
+
+
+# Modelowanie zmienności danych śróddziennych
+
+W tej części naszego projektu będziemy przekształcały szeregi stóp zwrotu obu spółek w taki sposób, aby pozbawić je wykrytej sezonowości zmienności (kształt litery "U"), aby przygotować dane do dalszego modelowania. Zgodnie z instrukcją będziemy stosowały dwie różne metody dla dwóch spółek.
+
+## Metoda Elastycznej Formy Fouriera (FFF) dla SPOLKA_D
+
+Najpierw musimy przygotować dane dzienne (czyli stopy zwrotu obliczone wyłącznie od otwarcia do zamknięcia sesji, bez luki nocnej), aby obliczyć prosty estymator zmienności dziennej (stanowiący punkt odniesienia do oceny, czy ruchy cen wewnątrz dnia są relatywnie duże).
+
+Następnie przygotowujemy zmienne do regresji: sinusy i cosinusy (funkcje odwzorowujące falisty kształt zmienności) oraz zmienne binarne dni tygodnia (pozwalające sprawdzić, czy specyfika handlu np. w piątki różni się od innych dni).
+
+```{r}
+# obliczamy żeby wiedzieć czy zmiany cen w ciągu dnia są duże czy małe
+
+# 1. obliczamy co działo się w skali całego dnia (od rana do wieczora)
+dzienne_D <- dane_5min_D %>%
+  group_by(date) %>%   # patrzymy na każdy dzień osobno (np. 1 stycznia, 2 stycznia itp)
+  summarise(
+    # bierzemy cenę z pierwszego słupka (np. 09:05) by mieć jakiś punkt startowy, a (nie mamy ceny idealnie z 09:00:00)
+    Open_Day = first(Close), 
+    
+    # bierzemy cenę z ostatniego słupka (17:05) jako koniec dnia
+    Close_Day = last(Close),
+    
+    # obliczamy ZYSK/STRATĘ z całej sesji (logarytmicznie)
+    # by wiedzieć czy w dany dniu była duża zmiana ceny, czy mała
+    Ret_Day = log(Close_Day) - log(Open_Day)
+  ) %>%
+  ungroup()
+
+# 2. obliczamy "standardową nerwowość" rynku (wariancja), (liczba która mówi nam jak przeciętnie w tym półroczu rynek był nerwowy)
+# używamy do tego wariancji z próby
+var_daily_sample <- var(dzienne_D$Ret_Day, na.rm = TRUE)
+
+# liczymy ile jest 5 minutowych kawałków w jednym dniu
+D_intervals <- length(unique(dane_5min_D$slot_czasowy))
+
+# dalej dzielimy "nerwowość całego dnia" na powyższe kawałki, żeby uzyskać "przeciętną nerwowość na 5 minut"
+# to będzie nasza miara; do tej liczby będziemy porównywały co się dzieje o 10:00 czy 12:00
+sigma_norm_sq <- var_daily_sample / D_intervals
+
+# 3.szykujemy tabelę którą wrzucimy do modelu (regresji)
+dane_fff <- dane_5min_D %>%
+  group_by(date) %>%
+  # numerujemy słupki w ciągu dnia: 1, 2, 3... aż do 97
+  # by model FFF wiedział który to jest moment dnia (czy rano czy wieczór)
+  # żeby narysować falę w dobrym miejscu.
+  mutate(n = row_number()) %>% 
+  ungroup() %>%
+  mutate(
+    
+    # (log) by wykres był ładniejszy dla statystyki
+    # dodajemy + 0.00000001 gdy zmiana ceny wyniesie 0 (bo logarytm z zera to błąd).
+    y_fff = 2 * log(abs(zwrot_log) + 0.00000001) - 2 * log(sqrt(sigma_norm_sq)),
+    
+    # + jaki dzień tygodnia, by sprawdzić, czy np. w piątki ludzie handlują inaczej niż w poniedziałki
+    day_of_week = wday(date, label = TRUE) 
+  )
+```
+
+Wybieramy model. Pętla sprawdzi rzędy opóźnień Fouriera oraz wersję z dniami tygodnia (dummies) i bez. Wybierzemy ten, który ma najniższe kryterium informacyjne AIC (kryterium oceny modelu –> im niższa wartość AIC, tym lepszy model, czyli taki, który najdokładniej opisuje dane przy najmniejszym stopniu skomplikowania).
+
+```{r}
+licz_aic_fff <- function(data, P, use_dummies) {
+  
+  # baza: zwykła parabola ("U"), n + n^2
+  formula_str <- "y_fff ~ n + I(n^2)"
+  
+  # + do wzoru "fale" (sinusy i cosinusy).
+  # parametr P mówi nam, ile tych fal dodać
+  for (p in 1:P) {
+    data[[paste0("sin", p)]] <- sin(2 * pi * p * data$n / D_intervals)
+    data[[paste0("cos", p)]] <- cos(2 * pi * p * data$n / D_intervals)
+    # dopisujemy je do wzoru matematycznego
+    formula_str <- paste0(formula_str, " + sin", p, " + cos", p)
+  }
+  
+  # czy uwzględniamy dni tygodnia?
+  # use_dummies = TRUE -> sprawdzimy, czy np. w poniedziałki jest inna zmienność niż w piątki
+  if (use_dummies) {
+    formula_str <- paste0(formula_str, " + day_of_week")
+  }
+  
+  # następnie budujemy model (lm) na podstawie tego wzoru który skleiliśmy powyżej
+  model <- lm(as.formula(formula_str), data = data)
+  
+  return(AIC(model))
+}
+
+# tabela ze wszystkimi kombinacjami do sprawdzenia
+# sprawdzimy wersję bez dni tygodnia (FALSE) i z dniami tygodnia (TRUE)
+# !!! TU ZMIANA: ZWIĘKSZAMY ZAKRES P DO 8 !!!
+wyniki_aic <- expand.grid(P = 1:8, Dummies = c(FALSE, TRUE))
+wyniki_aic$AIC <- NA # pusta kolumna na wyniki
+
+# petla: sprawdzamy każdą kombinację po kolei
+for (i in 1:nrow(wyniki_aic)) {
+  wyniki_aic$AIC[i] <- licz_aic_fff(dane_fff, wyniki_aic$P[i], wyniki_aic$Dummies[i])
+}
+
+wyniki_aic
+
+best_model_params <- wyniki_aic[which.min(wyniki_aic$AIC), ]
+```
+
+```{r}
+print(paste("Najlepszy model: P =", best_model_params$P, ", Dummies =", best_model_params$Dummies))
+```
+
+W tej części korzystamy z wyników castingu. Skoro już mamy najlepsze parametry dzięki powyższej tabeli, ile fal (P) i czy dni tygodnia są potrzebne, to teraz będziemy budować nasz ostateczny model, wyciągamy z niego kształt "U" i usuwamy go z naszych danych.
+
+```{r}
+# 1. nasze parametry z poprzedniego kroku
+best_P <- best_model_params$P
+use_dummies <- best_model_params$Dummies
+
+# 2. nowa tabela w której zbudujemy nasz model
+dane_fff_final <- dane_fff
+
+# nasz wykres, standardowa parabola (n + n^2) ("U")
+formula_final <- "y_fff ~ n + I(n^2)"
+
+# 3. + do tabeli i do przepisu tyle fal (sinusów/cosinusów), ile wygrało w naszym powyższym castingu
+for (p in 1:best_P) {
+  s_name <- paste0("sin", p) # + nazwy
+  c_name <- paste0("cos", p)
+  
+  # obliczamy wartości fal i wpisujemy do kolumn w tabeli
+  dane_fff_final[[s_name]] <- sin(2 * pi * p * dane_fff_final$n / D_intervals)
+  dane_fff_final[[c_name]] <- cos(2 * pi * p * dane_fff_final$n / D_intervals)
+  
+  # dopisujemy fale do naszej formuły
+  formula_final <- paste0(formula_final, " + ", s_name, " + ", c_name)
+}
+
+# 4. jeśli w naszym castingu wyszło, że dni tygodnia są ważne, to też dopisujemy je do przepisu
+if (use_dummies) {
+  formula_final <- paste0(formula_final, " + day_of_week")
+}
+
+# 5. start regresji (lm)
+model_fff <- lm(as.formula(formula_final), data = dane_fff_final)
+
+# 6. wyciągamy z modelu to, co nas interesuje -> kształt sezonowości
+# model będzie zwracał wynik w logarytmach (bo tak go uczyłyśmy na początku: 2*log...).
+# używamy funkcji exp() by odwrócić logarytm i dostać normalną liczbę
+# : przez 2 (bo we wzorze było "2 * log")
+dane_fff_final$log_s2_hat <- fitted(model_fff)
+dane_fff_final$sezonowosc <- exp(dane_fff_final$log_s2_hat / 2)
+
+# 7. normalizacja
+# chcemy żeby średnia "sezonowość" wynosiła 1, dzięki temu nie zmieniamy ogólnego poziomu ryzyka w danych, tylko zmieniamy jego rozkład w czasie dnia
+norm_factor <- mean(dane_fff_final$sezonowosc)
+dane_fff_final$sezonowosc <- dane_fff_final$sezonowosc / norm_factor
+
+# 8. odsezonowanie (czyszczenie danych)
+# dzielimy prawdziwy zwrot przez wyliczoną sezonowość
+# np: jeśli o 9:00 rano zmienność jest zwykle 2 razy większa (sezonowość = 2), to dzielimy zwrot przez 2
+# dzięki temu zostanie nam "czysty" zwrot, pozbawiony efektu pory dnia.
+dane_fff_final$zwrot_odsezonowany <- dane_fff_final$zwrot_log / dane_fff_final$sezonowosc
+```
+
+Generujemy nasze wykresy: porównanie średnich modułów przed i po (przed krzywe "U", teraz płaska linia), autokorelacja przed i po (były fale, teraz jest szum), oraz kształt sezonowości (który wykryliśmy i usunęliśmy).
+
+```{r}
+# 1. porównanie przed vs Po (czy usunęliśmy "U")
+porownanie_D <- dane_fff_final %>%
+  group_by(slot_czasowy) %>%
+  summarise(
+    # Liczymy średnią "nerwowość" rynku dla każdej godziny (np. średnia dla 10:00, 10:05...)
+    # Przed: bierzemy surowe dane (~ "U")
+    Przed = mean(abs(zwrot_log), na.rm=TRUE),
+    # Po: bierzemy dane wyczyszczone (~ płaska kreska)
+    Po = mean(abs(zwrot_odsezonowany), na.rm=TRUE) 
+  ) %>%
+  # + sztuczna data by wykres wiedział że oś X to czas
+  mutate(czas = as.POSIXct(paste("2024-01-01", slot_czasowy), format="%Y-%m-%d %H:%M"))
+
+# wykres
+ggplot(porownanie_D) +
+  geom_line(aes(x = czas, y = Przed, color = "Przed modyfikacją"), size = 1) +
+  geom_line(aes(x = czas, y = Po, color = "Po modyfikacji"), size = 1) +
+  labs(title = "SPOLKA_D: Średnie |r| Przed i Po FFF", y = "Średni moduł zwrotu", x = "Godzina", color = "Legenda") +
+  theme_minimal() +
+  scale_x_datetime(date_labels = "%H:%M")
+```
+
+Wykres "przed" wykazuje kształt litery U z wysokimi wartościami na otwarciu i zamknięciu sesji. Po zastosowaniu modelu FFF (czerwona linia) ten wzorzec został przełamany, a ekstremalne skoki na krańcach sesji skutecznie zredukowane. Mimo że wykres "po" nie jest idealnie płaski (widoczne lekkie wzniesienie w środku dnia, wynikające z prostoty modelu P=1), główny cel został przez nas osiągnięty: wyeliminowano silną, deterministyczną sezonowość otwarcia i zamknięcia.
+
+
+```{r}
+# 2. autokorelacja (ACF)
+par(mfrow = c(2, 1)) # by wykresy były jeden pod drugim
+
+# wykres "przed": ~ fale (rynek codziennie powtarza ten sam schemat "U")
+acf(abs(dane_fff_final$zwrot_log), lag.max = 500, ylim = c(0, 0.2),
+    main = "ACF |r| - Przed (ZOOM: Szukamy fal co ~100 lagów)")
+
+# wykres "po": bez fale zniknąć lub dużo mniejsze (sukces = brak cykliczności)
+acf(abs(dane_fff_final$zwrot_odsezonowany), lag.max = 500, ylim = c(0, 0.2),
+    main = "ACF |r| - Po")
+
+par(mfrow = c(1, 1)) # jeden wykres na ekran
+```
+
+Na górnym wykresie widać, powtarzające się "fale” (lokalne górki co ok. 100 opóźnień), co dowodzi, że zmienność zależy od pory dnia (sezonowość). Na dolnym wykresie te fale zniknęły/są mniejsze/mniej wyraźne, co potwierdza, że metoda FFF skutecznie oczyściła dane z efektu pory dnia.
+
+```{r}
+# 3.sezonowość (s_t) -> to co wyciełyśmy z danych
+if (use_dummies) {
+  # A: jeśli model wykrył różnice między dniami tygodnia, rysujemy osobne linie dla każdego dnia
+  ggplot(dane_fff_final, aes(x = n, y = sezonowosc, color = day_of_week)) +
+    stat_summary(fun = mean, geom = "line", size = 1) +
+    labs(title = "Kształt sezonowości (inny dla każdego dnia)", x = "Nr interwału (n)", y = "Mnożnik s_t") +
+    theme_minimal()
+} else {
+  # B: jeśli dni są takie same, rysujemy jedną linię (jedno "U")
+  ggplot(dane_fff_final, aes(x = n, y = sezonowosc)) +
+    stat_summary(fun = mean, geom = "line", color = "blue", size = 1) +
+    labs(title = "Kształt sezonowości (uniwersalny)", x = "Nr interwału (n)", y = "Mnożnik s_t") +
+    theme_minimal()
+}
+```
+
+Nasz powyższy wykres obrazuje wyizolowany wzorzec sezonowości. Wszystkie krzywe przyjmują kształt litery "U" (wysoka zmienność na otwarciu i zamknięciu, niska w środku dnia). Rozwarstwienie linii potwierdza istotność dni tygodnia (zgodnie z wynikiem kryterium AIC): mimo zachowania wspólnego kształtu sesji, poszczególne dni różnią się ogólnym poziomem zmienności –> widać wyraźny podział na dni o systematycznie wyższej (górne linie) i niższej (dolne linie) aktywności rynku.
+
+
+## Metoda Engle-Sokalskiej dla SPOLKA_H
+
+W tej metodzie musimy oddzielić dwie rzeczy, które mieszają się w cenie akcji:
+
+ - Jaki to był dzień (czy na rynku panował ogólny "chaos", czy spokój?). Obliczymy modelem GARCH.
+
+ - Jaka to pora dnia (czy maklerzy są na lunchu, czy dopiero zaczynają pracę?). To nasz wzorzec sezonowy.
+
+Najpierw obliczamy ogólną "nerwowość" całego dnia (GARCH), a potem używamy tego wyniku, żeby oczyścić dane i zobaczyć, jak rynek zachowuje się w konkretnych godzinach (interwałach).
+
+```{r}
+# metoda Engle i Sokalskiej dla naszej spolka_h
+# cel: chcemy oczyścić dane z dwóch rzeczy: wpływu konkretnego dnia i wpływu godziny (np. otwarcie giełdy)
+
+
+# krok 1: przygotowanie danych dziennych
+# aby wiedzieć co działo się w skali całego dnia, żeby model GARCH miał na czym pracować będziemy sumować zwroty z 5-minutówek, aby uzyskać jeden zwrot dla całego dnia
+dzienne_H <- dane_5min_H %>%
+  group_by(date) %>%
+  summarise(Ret_Day = sum(zwrot_log, na.rm = TRUE)) %>% 
+  ungroup()
+
+# krok 2: obliczenie ryzyka dla każdego dnia (model GARCH)
+# model garch na danych dziennych
+# model wyliczy "sigmę" (liczbę która powie nam jak bardzo ryzykowny/zmienny był każdy konkretny dzień)
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(1, 1), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+fit_garch <- ugarchfit(spec = spec, data = dzienne_H$Ret_Day)
+
+# krok 3: przypisanie ryzyka dnia do każdej 5-minutówki
+# bierzemy wyliczoną wyżej sigmę (ryzyko dnia) i doklejamy ją do naszych danych
+# (będziemy widziały przy każdej godzinie (np. 10:00), czy ten dzień ogólnie był spokojny czy nerwowy)
+
+# + as.numeric(), żeby pozbyć się formatu xts, by R potraktował wyniki z modelu GARCH jako zwykłe liczby
+dzienne_H$sigma_day_garch <- as.numeric(sigma(fit_garch))
+
+dane_es <- dane_5min_H %>%
+  left_join(dzienne_H[, c("date", "sigma_day_garch")], by = "date")
+
+# krok 4: wyznaczenie wzorca godziny (sezonowość)
+# sprawdzamy, czy dana godzina (slot) jest zazwyczaj bardziej zmienna niż reszta dnia
+# dzielimy zmienność chwili przez zmienność dnia i wyciągamy średnią
+# s_d będzie mówił nam czy na przykład "o tej godzinie jest zwykle X razy bardziej nerwowo niż średnio"
+sezonowosc_ES <- dane_es %>%
+  mutate(ratio = zwrot_log^2 / sigma_day_garch^2) %>% # relacja: chwila vs dzień
+  group_by(slot_czasowy) %>%
+  summarise(s_d_sq = mean(ratio, na.rm=TRUE)) %>%     # uśredniamy wynik dla każdej godziny
+  mutate(s_d = sqrt(s_d_sq))                          # pierwiastek daje nam finalny wskaźnik
+
+# dodajemy ten wskaźnik godziny do głównych danych
+dane_es <- dane_es %>%
+  left_join(sezonowosc_ES[, c("slot_czasowy", "s_d")], by = "slot_czasowy")
+
+# krok 5: ostateczne czyszczenie (odsezonowanie)
+# dzielimy nasze zwroty przez oba wykryte efekty:
+# 1. przez ryzyko dnia (sigma) -> usuwamy wpływ wydarzeń z danego dnia
+# 2. przez wskaźnik godziny (s_d) -> usuwamy wpływ pory dnia (np. otwarcia)
+# dostaniemy "czysty zwrot"
+dane_es <- dane_es %>%
+  mutate(
+    zwrot_odsezonowany = zwrot_log / (sigma_day_garch * s_d)
+  )
+```
+
+Generujemy wykresy porównawcze dla metody Engle i Sokalskiej.
+
+```{r}
+# 1. porównanie średnich |r| (zmienności)
+
+porownanie_H <- dane_es %>%
+  group_by(slot_czasowy) %>% # analizujemy każdą godzinę osobno (dla przykładu: wszystkie 9:05 razem)
+  summarise(
+    # przed: średnia siła zmian ceny w surowych danych; tutaj będziemy spodziewały się "U"
+    Przed = mean(abs(zwrot_log), na.rm=TRUE),
+    
+    # po: średnia siła zmian w danych oczyszczonych; tutaj spodziewamy się płaskiej linii (szumu)
+    Po = mean(abs(zwrot_odsezonowany), na.rm=TRUE)
+  ) %>%
+  # zamieniamy tekst "09:05" na datę by wykres wiedział, że to oś czasu
+  mutate(czas = as.POSIXct(paste("2024-01-01", slot_czasowy), format="%Y-%m-%d %H:%M"))
+
+# p1: wykres "przed" (górny)
+p1 <- ggplot(porownanie_H, aes(x = czas, y = Przed)) + geom_line(color = "blue") +
+  labs(title = "SPOLKA_H: Przed (z 'U')", y = "|r|") + 
+  theme_minimal() + scale_x_datetime(date_labels="%H:%M")
+
+# p2: wykres "po" (dolny)
+# rysujemy dane oczyszczone; oś y jako |epsilon| (szum/reszta)
+p2 <- ggplot(porownanie_H, aes(x = czas, y = Po)) + geom_line(color = "red") +
+  labs(title = "SPOLKA_H: Po (Engle i Sokalska)", y = "|epsilon|") + 
+  theme_minimal() + scale_x_datetime(date_labels="%H:%M")
+
+grid.arrange(p1, p2, ncol = 1)
+```
+
+
+Na górnym wykresie widzimy wyraźne "U" –> wartości są wysokie rano, spadają w południe i rosną na koniec sesji. Dolny wykres pokazuje dane po oczyszczeniu modelem Engle i Sokalskiej. Kształt litery "U" zniknął. Czyli, metoda skutecznie usunęła wpływ pory dnia na zmienność.
+
+
+```{r}
+# 2. Autokorelacja (czy usunęliśmy/zmniejszyłyśmy fale)
+par(mfrow = c(2, 1)) # Ustawiamy wykresy jeden pod drugim
+
+# wykres przed: widoczne "górki" co ok. 100 lagów (cykliczność co 1 dzień)
+acf(abs(dane_es$zwrot_log), lag.max = 500, ylim = c(0, 0.2),
+    main = "ACF |r| - Przed")
+
+# wykres po: zmniejszenie/usuniecie "górek" na wykresie = sukces
+acf(abs(dane_es$zwrot_odsezonowany), lag.max = 500, ylim = c(0, 0.2),
+    main = "ACF |r| - Po")
+```
+
+**Przed modyfikacją (górny wykres):** widzimy wyraźne, cykliczne "górki" powtarzające się co ok. 100 opóźnień (jeden dzień sesyjny). Potwierdza to, że zmienność jest silnie zależna od pory dnia.
+
+**Po modyfikacji (dolny wykres):** zniknęły cykliczne "górki", co oznacza, że skutecznie usunęłyśmy wpływ pory dnia (np. przerwy na lunch czy otwarcia giełdy). Pozostała na wykresie opadająca linia (bez fal) jest naturalna i pożądana –> pokazuje, że rynek ma "pamięć" (okresy spokoju i nerwowości trwają dłużej niż chwilę), co teraz możemy poprawnie modelować.
+
+```{r}
+# 3. wykres składowej sezonowej s_d
+# wykres z celem pokazania jak wygląda typowy dzień na giełdzie (gdzie jest nerwowo, a gdzie spokojnie)
+
+ggplot(sezonowosc_ES, aes(x = 1:nrow(sezonowosc_ES), y = s_d)) +
+  # oś X: kolejne pory dnia (od rana do wieczora)
+  # os Y: mnożnik "nerwowości" (s_d)
+  #   - s_d > 1 -> bardziej nerwowo niż zwykle (górki)
+  #   - s_d < 1 -> spokojniej (doliny)
+  
+  geom_line(size = 1, color = "blue") +
+  
+  labs(title = "Profil sezonowości (Engle i Sokalska) dla SPOLKA_H", 
+       x = "Interwał intraday (kolejne 5-minutówki)", 
+       y = "Mnożnik s_d") +
+  
+  theme_minimal()
+```
+
+Wykres przedstawia wyznaczony wzorzec sezonowości (sd​), który przyjmuje klasyczny kształt litery "U”. Wysokie wartości na początku i końcu wykresu (sd​>1) potwierdzają, że zmienność jest najwyższa podczas otwarcia i zamknięcia sesji. Obniżenie wykresu w środkowej części (sd​<1) wskazuje na typowe dla giełdy uspokojenie handlu w godzinach okołopołudniowych.
+
+
+## Podsumowanie etapu:
+
+Celem naszej analizy było usunięcie deterministycznej sezonowości śróddziennej (kształtu "U”) ze stóp zwrotu.
+
+ - Dla Spółki D (metoda FFF): Nasz model (dobrany przez AIC: P=1, z uwzględnieniem dni tygodnia) skutecznie zniwelował ekstremalną zmienność na otwarciu i zamknięciu sesji.
+
+ - Dla Spółki H (metoda Engle-Sokalskiej): Procedura odsezonowania wyeliminowała cykliczne wzorce widoczne na wykresach autokorelacji (ACF).
+
+**Wniosek:** Uzyskane szeregi czasowe są pozbawione wpływu pory dnia i reprezentują teraz czystą zmienność stochastyczną.
+
+
+# Podsumowanie końcowe
+
+Nasza analiza potwierdziła występowanie typowych cech mikrostruktury rynku: grubych ogonów rozkładu, ujemnej autokorelacji oraz wyraźnej sezonowości zmienności w kształcie litery "U". Zastosowanie metod FFF (dla spółki niepłynnej) oraz Engle-Sokalskiej (dla spółki płynnej) pozwoliło skutecznie usunąć deterministyczny wpływ pory dnia. Wyeliminowanie cyklicznych wzorców sprawiło, że uzyskane dane reprezentują teraz czystą zmienność stochastyczną i są poprawnie przygotowane do dalszego modelowania ekonometrycznego.
