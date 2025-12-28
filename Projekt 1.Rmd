@@ -1,6 +1,6 @@
 ---
 title: "Analiza Mikrostruktury Rynków Finansowych i Modelowanie Zmienności Śróddziennej"
-author: "Klaudia Rajca, Aleksandra Konopelska"
+author: "K.R, Aleksandra Konopelska"
 date: "2025-12-17"
 output: 
   html_document:
@@ -868,5 +868,6 @@ Celem naszej analizy było usunięcie deterministycznej sezonowości śróddzien
 
 
 # Podsumowanie końcowe
+
 
 Nasza analiza potwierdziła występowanie typowych cech mikrostruktury rynku: grubych ogonów rozkładu, ujemnej autokorelacji oraz wyraźnej sezonowości zmienności w kształcie litery "U". Zastosowanie metod FFF (dla spółki niepłynnej) oraz Engle-Sokalskiej (dla spółki płynnej) pozwoliło skutecznie usunąć deterministyczny wpływ pory dnia. Wyeliminowanie cyklicznych wzorców sprawiło, że uzyskane dane reprezentują teraz czystą zmienność stochastyczną i są poprawnie przygotowane do dalszego modelowania ekonometrycznego.
