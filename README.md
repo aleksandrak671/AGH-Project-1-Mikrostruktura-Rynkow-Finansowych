@@ -1,4 +1,4 @@
-# Market Microstructure and Intraday Volatility Modeling
+# Market Microstructure and Intraday Volatility – Project 1
 
 This project analyzes high-frequency financial data (tick-by-tick) from the Warsaw Stock Exchange. The main objective is to identify intraday seasonality patterns and remove them using econometric modeling methods to prepare data for further stochastic analysis.
 
